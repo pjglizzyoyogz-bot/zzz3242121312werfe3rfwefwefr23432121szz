@@ -9,7 +9,7 @@ local Players = game:GetService("Players")
 -- ===== CONFIGURATION =====
 local CONFIG = {
     -- Local File Configuration
-    LOCAL_FILE_PATH = "C:/Users/ghait/AppData/Local/Wave/workspace", -- Windows absolute path
+    LOCAL_FILE_PATH = "C:/Users/ghait/AppData/Local/Wave/workspace/JobidJson.json", -- Windows absolute path
     
     -- Game Configuration
     UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport (ensure this is PlaceId, not universe id if different)
