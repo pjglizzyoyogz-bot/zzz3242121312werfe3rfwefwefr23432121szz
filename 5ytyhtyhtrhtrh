@@ -1,6 +1,6 @@
--- FULLY AUTOMATIC ROBLOX HOPPER - LOCAL FILE MODE
--- This script reads from a local JSON file populated by the scanner
--- No HTTP requests needed - pure local file mode
+-- FULLY AUTOMATIC ROBLOX HOPPER - MOBILE SUPPORT (PASTEBIN MODE)
+-- This script uses Pastebin instead of local files for Android/mobile executors
+-- Reads job IDs from Pastebin raw URL updated by scannermobile.js
 
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
@@ -8,29 +8,44 @@ local Players = game:GetService("Players")
 
 -- ===== CONFIGURATION =====
 local CONFIG = {
-    -- Local File Configuration
-    LOCAL_FILE_PATH = "C:/Users/1/AppData/Roaming/Zenith/Workspace/JobidJson.json", -- Windows absolute path
+    -- Pastebin Configuration (replace with your actual Pastebin raw URL)
+    PASTEBIN_RAW_URL = getgenv().PASTEBIN_RAW_URL or "https://gist.githubusercontent.com/pjglizzyoyogz-bot/bb2baf7e03d5a50cb282e8931384317d/raw/b7b3b9563a846f913f8de24b6cfa8c7c86e5aa9d/jobids.json",
     
     -- Game Configuration
-    UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport (ensure this is PlaceId, not universe id if different)
-    PLACE_ID = 109983668079237,    -- explicit place id (change if different from universe)
+    UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport
+    PLACE_ID = 109983668079237,    -- explicit place id
     
     -- Timing
-    CHECK_INTERVAL = 0.25, -- base polling interval (reduced)
-    RETRY_DELAY = 0.5,     -- delay after failure (short)
+    CHECK_INTERVAL = 0.25,
+    RETRY_DELAY = 0.5,
     MAX_RETRY_ATTEMPTS = 3,
-    FAST_MODE = true,      -- enable aggressive speed optimizations
-    JSON_CACHE_TTL = 2,    -- seconds to cache file read
-    MAX_LOOP_BURST = 15,   -- max rapid iterations before yielding
+    FAST_MODE = true,
+    CACHE_TTL = 2, -- seconds to cache HTTP responses
+    MAX_LOOP_BURST = 15,
     
-    -- Client ID (unique per account)
+    -- Client ID
     CLIENT_ID = HttpService:GenerateGUID(false)
 }
 
--- ===== SHARED GLOBAL STATE (across all accounts) =====
+-- ===== HTTP REQUEST HELPER =====
+local request = (function()
+    local methods = {
+        syn and syn.request,
+        http and http.request,
+        http_request,
+        fluxus and fluxus.request,
+        request
+    }
+    for _, method in ipairs(methods) do
+        if method then return method end
+    end
+    error("No HTTP request function found!")
+end)()
+
+-- ===== SHARED GLOBAL STATE =====
 _G.ServerHopperShared = _G.ServerHopperShared or {
-    assignedJobIds = {}, -- JobIds currently assigned to any account
-    localBlocklist = {} -- Local blocklist cached from file
+    assignedJobIds = {},
+    localBlocklist = {}
 }
 
 -- ===== STATE =====
@@ -38,8 +53,8 @@ local State = {
     currentJobId = nil,
     isAttemptingJoin = false,
     retryCount = 0,
-    assignedJobIds = {}, -- Track what this client has been assigned
-    lastBlocklistCheck = 0 -- Last time we checked blocklist
+    assignedJobIds = {},
+    lastBlocklistCheck = 0
 }
 
 -- ===== LOGGING =====
@@ -53,232 +68,125 @@ end
 local function logError(message) log(message, "ERROR") end
 local function logWarning(message) log(message, "WARN") end
 
--- ===== STORAGE (Local File) =====
+-- ===== PASTEBIN STORAGE (replaces file I/O) =====
 local _cache = { data = nil, ts = 0 }
 
-local function readLocalFile()
-    if not isfile or not readfile then
-        logError("Executor does not expose file APIs (isfile/readfile)")
+local function httpGetJobStore()
+    local url = CONFIG.PASTEBIN_RAW_URL
+    local ok, response = pcall(function()
+        return request({
+            Url = url,
+            Method = "GET",
+            Headers = { ["Accept"] = "application/json" }
+        })
+    end)
+    
+    if not ok or not response or response.StatusCode ~= 200 then
+        logError("Failed to fetch job store from Pastebin")
         return nil
     end
-
-    -- helper to trim and check emptiness
-    local function isEmptyString(s)
-        return s == nil or s == "" or not tostring(s):find("%S")
+    
+    local parseOk, data = pcall(function()
+        return HttpService:JSONDecode(response.Body)
+    end)
+    
+    if not parseOk then
+        logError("Failed to parse job store response")
+        return nil
     end
-
-    -- ensure file exists; if not, create a minimal valid structure
-    if not isfile(CONFIG.LOCAL_FILE_PATH) then
-        logWarning("Local file missing: " .. CONFIG.LOCAL_FILE_PATH .. " -> creating base file")
-        if writefile then
-            local seed = { availableJobIds = {}, blocklist = {}, stats = { created = os.time(), reason = "created_missing" } }
-            local okCreate, errCreate = pcall(function()
-                writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(seed))
-            end)
-            if not okCreate then
-                logError("Failed to create base file: " .. tostring(errCreate))
-                return nil
-            end
-        else
-            return nil
-        end
-    end
-
-    -- read with a few retries to survive concurrent partial writes
-    local lastErr
-    for attempt = 1, 5 do
-        local okRead, content = pcall(readfile, CONFIG.LOCAL_FILE_PATH)
-        if not okRead then
-            lastErr = content
-            logWarning("Read attempt " .. attempt .. " failed: " .. tostring(content))
-            wait(0.2)
-        else
-            if isEmptyString(content) then
-                -- empty/whitespace-only -> recreate a base file
-                logWarning("Local file is empty -> recreating base JSON")
-                if writefile then
-                    local seed = { availableJobIds = {}, blocklist = {}, stats = { recreated = os.time(), reason = "empty" } }
-                    pcall(function() writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(seed)) end)
-                    return seed
-                else
-                    return nil
-                end
-            end
-            local okDecode, decoded = pcall(function()
-                return HttpService:JSONDecode(content)
-            end)
-            if okDecode and type(decoded) == "table" then
-                return decoded
-            else
-                lastErr = decoded
-                -- likely read during a write (partial JSON); brief retry
-                if attempt < 5 then wait(0.25) end
-            end
-        end
-    end
-
-    -- If we get here, decoding kept failing. Try to recover by rewriting a sane base.
-    logWarning("Invalid JSON in local file after retries -> attempting recovery")
-    local seedFromCache = { availableJobIds = {}, blocklist = {}, stats = { recovered = os.time(), reason = "corrupt_after_retries" } }
-    if _cache and _cache.data then
-        seedFromCache.availableJobIds = _cache.data.availableJobIds or {}
-        seedFromCache.blocklist = _cache.data.blocklist or {}
-        if type(_cache.data.stats) == "table" then
-            for k, v in pairs(_cache.data.stats) do seedFromCache.stats[k] = v end
-        end
-        seedFromCache.stats.recoveredFromCache = true
-    end
-    if writefile then
-        local okWrite = pcall(function()
-            writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(seedFromCache))
-        end)
-        if okWrite then
-            return seedFromCache
-        end
-    end
-    logError("Invalid JSON in local file (unrecoverable)")
-    return nil
+    
+    return data
 end
 
-local function writeLocalFile(tbl)
-    if not writefile then return false end
-    local ok, err = pcall(function()
-        writefile(CONFIG.LOCAL_FILE_PATH, HttpService:JSONEncode(tbl))
-    end)
-    if not ok then
-        logWarning("Failed writing local file: " .. tostring(err))
-        return false
-    end
+local function httpBlockJobId(jobId, reason)
+    -- Pastebin is read-only for clients, just track locally
+    table.insert(_G.ServerHopperShared.localBlocklist, jobId)
+    log("🚫 Locally blocked JobId: " .. jobId .. " (" .. (reason or "unknown") .. ")")
     return true
+end
+
+local function httpSkipJobId(jobId)
+    -- Pastebin is read-only, skip functionality is client-side only
+    if not CONFIG.FAST_MODE then log("⏭️ Skipping JobId: " .. jobId) end
 end
 
 local function storageRead(force)
     local now = os.clock()
-    if not force and _cache.data and (now - _cache.ts) < CONFIG.JSON_CACHE_TTL then
+    if not force and _cache.data and (now - _cache.ts) < CONFIG.CACHE_TTL then
         return _cache.data
     end
     
-    local result = readLocalFile()
+    local result = httpGetJobStore()
     
     if result then
         _cache.data = result
         _cache.ts = now
         return result
     end
-    -- Fallback to cached data to avoid stalls when reads temporarily fail
+    
+    -- Fallback to cached data
     if _cache.data then
-        if not CONFIG.FAST_MODE then log("Using cached data due to read failure") end
+        if not CONFIG.FAST_MODE then log("Using cached data due to fetch failure") end
         return _cache.data
     end
+    
     return nil
-end
-
-local function storageWrite(data)
-    return writeLocalFile(data)
 end
 
 -- ===== JOB ID MANAGEMENT =====
 local function getNextJobId()
     local data = storageRead()
     if not data then return nil end
+    
     local available = data.availableJobIds or {}
     local blocklist = data.blocklist or {}
+    
     if #available == 0 then return nil end
-    -- build fast lookup sets once per call
+    
+    -- Build fast lookup sets
     local blockedSet = {}
     for _, b in ipairs(blocklist) do blockedSet[b] = true end
+    
     local triedSet = {}
     for _, t in ipairs(State.assignedJobIds) do triedSet[t] = true end
+    
     local globalAssigned = _G.ServerHopperShared.assignedJobIds
-    -- reservoir style random pick without building big tables
+    
+    -- Reservoir-style random pick
     local pick = nil
     local count = 0
+    
     for _, jobId in ipairs(available) do
-        if not blockedSet[jobId] and not triedSet[jobId] and (not globalAssigned[jobId] or globalAssigned[jobId] == CONFIG.CLIENT_ID) then
+        if not blockedSet[jobId] and not triedSet[jobId] and 
+           (not globalAssigned[jobId] or globalAssigned[jobId] == CONFIG.CLIENT_ID) then
             count = count + 1
             if math.random(count) == 1 then pick = jobId end
         end
     end
+    
     if not pick then
         logWarning("No valid JobId (all blocked/used)")
         return nil
     end
+    
     table.insert(State.assignedJobIds, pick)
     globalAssigned[pick] = CONFIG.CLIENT_ID
+    
     if not CONFIG.FAST_MODE then log("Selected JobId: " .. pick) end
     return pick
 end
 
 local function blockJobId(jobId, reason)
     log("🚫 Blocking JobId: " .. jobId .. " | Reason: " .. reason)
-    
-    -- Add to local blocklist immediately
     table.insert(_G.ServerHopperShared.localBlocklist, jobId)
-    
-    local data = storageRead()
-    if not data then
-        -- Create a minimal structure so we can still persist the block
-        data = { availableJobIds = {}, blocklist = {} }
-    end
-    
-    -- Add to blocklist if not already there
-    local blocklist = data.blocklist or {}
-    local alreadyBlocked = false
-    
-    for _, blockedId in ipairs(blocklist) do
-        if blockedId == jobId then
-            alreadyBlocked = true
-            break
-        end
-    end
-    
-    if not alreadyBlocked then
-        table.insert(blocklist, jobId)
-        data.blocklist = blocklist
-        
-        -- REMOVE from availableJobIds list
-        local newAvailable = {}
-        for _, id in ipairs(data.availableJobIds or {}) do
-            if id ~= jobId then
-                table.insert(newAvailable, id)
-            end
-        end
-        data.availableJobIds = newAvailable
-        
-    if storageWrite(data) then
-            log("✅ JobId blocked and removed from available list")
-            return true
-        end
-    else
-        log("ℹ️  JobId already blocked")
-    end
-    
-    return false
+    httpBlockJobId(jobId, reason)
 end
 
--- Pre-block job id (lightweight: edits JsonBin once) so no other account selects it while we are teleporting
 local function preBlockJobId(jobId)
-    -- read cached (force refresh)
-    local data = storageRead(true)
-    if not data then
-        data = { availableJobIds = {}, blocklist = {} }
-    end
-    data.blocklist = data.blocklist or {}
-    -- already blocked? then fine
-    for _, b in ipairs(data.blocklist) do if b == jobId then return true end end
-    table.insert(data.blocklist, jobId)
-    -- remove from available list immediately
-    if data.availableJobIds then
-        local filtered = {}
-        for _, id in ipairs(data.availableJobIds) do if id ~= jobId then table.insert(filtered, id) end end
-        data.availableJobIds = filtered
-    end
-    if storageWrite(data) then
-        -- also reflect in cache structures
-        _G.ServerHopperShared.localBlocklist[jobId] = true
-        return true
-    end
-    return false
+    -- Pre-block immediately to prevent race conditions
+    httpBlockJobId(jobId, "pre_block_before_teleport")
+    _G.ServerHopperShared.localBlocklist[jobId] = true
+    return true
 end
 
 -- ===== TELEPORT LOGIC =====
@@ -287,7 +195,8 @@ local function parseErrorReason(errorMsg)
     
     if string.find(errorLower, "full") or string.find(errorLower, "capacity") then
         return "Server is full"
-    elseif string.find(errorLower, "can't join private") or string.find(errorLower, "cant join private") or string.find(errorLower, "unauthorized") then
+    elseif string.find(errorLower, "can't join private") or string.find(errorLower, "cant join private") or 
+           string.find(errorLower, "unauthorized") then
         return "Private / Unauthorized instance"
     elseif string.find(errorLower, "invalid") or string.find(errorLower, "not found") then
         return "Invalid or closed server"
@@ -304,21 +213,32 @@ local function attemptTeleport(jobId)
         logError("AttemptTeleport called with nil/empty jobId")
         return false
     end
+    
     State.isAttemptingJoin = true
     if not CONFIG.FAST_MODE then log("Attempt teleport -> " .. tostring(jobId)) end
+    
     local player = Players.LocalPlayer
     local success, errorMessage = pcall(function()
         TeleportService:TeleportToPlaceInstance(CONFIG.PLACE_ID or CONFIG.UNIVERSE_ID, jobId, player)
     end)
+    
     if not success then
         local reason = parseErrorReason(errorMessage)
         logError("Teleport failed: " .. reason .. " | jobId=" .. tostring(jobId))
-        blockJobId(jobId, reason)
+        
+        -- Check if server is full (skip) vs unavailable (block)
+        if string.find(reason:lower(), "full") then
+            httpSkipJobId(jobId)
+        else
+            blockJobId(jobId, reason)
+        end
+        
         State.isAttemptingJoin = false
         State.currentJobId = nil
         State.retryCount = State.retryCount + 1
         return false
     end
+    
     if not CONFIG.FAST_MODE then log("Teleport initiated jobId=" .. tostring(jobId)) end
     return true
 end
@@ -326,78 +246,74 @@ end
 -- ===== MAIN LOOP =====
 local function mainLoop()
     log("╔════════════════════════════════════════════════════════════╗")
-    log("║     🎮 FULLY AUTOMATIC SERVER HOPPER - LOCAL FILE MODE    ║")
+    log("║    🎮 AUTOMATIC SERVER HOPPER - MOBILE SUPPORT (PASTEBIN) ║")
     log("╚════════════════════════════════════════════════════════════╝")
     log("Client ID: " .. CONFIG.CLIENT_ID)
     log("Universe ID: " .. CONFIG.UNIVERSE_ID)
-    log("Local File: " .. CONFIG.LOCAL_FILE_PATH)
+    log("Pastebin URL: " .. CONFIG.PASTEBIN_RAW_URL)
     log("════════════════════════════════════════════════════════════")
     
-    -- Removed auto-block of current server; we only block the NEXT one we select (pre-block before teleport)
-    
-    -- Resilient file loading (keep retrying)
+    -- Resilient store loading
     local attempt = 0
     local testData
     repeat
-        attempt += 1
+        attempt = attempt + 1
         if attempt == 1 then
-            log("🔍 Loading local file...")
+            log("🔍 Loading job store from Pastebin...")
         else
-            logWarning("Retrying file read (attempt " .. attempt .. ")")
+            logWarning("Retrying fetch (attempt " .. attempt .. ")")
         end
         testData = storageRead(true)
         if not testData then
-            local backoff = math.min(10, 1 * 2 ^ math.min(6, attempt - 1)) -- 1,2,4,8,10,10...
-            logWarning("File unreadable. Backing off for " .. backoff .. "s")
+            local backoff = math.min(10, 1 * 2 ^ math.min(6, attempt - 1))
+            logWarning("Pastebin unreachable. Backing off for " .. backoff .. "s")
             wait(backoff)
         end
     until testData ~= nil
-    log("✅ File ready after " .. attempt .. " attempt(s)")
+    
+    log("✅ Store ready after " .. attempt .. " attempt(s)")
     log("📊 Found " .. #(testData.availableJobIds or {}) .. " available JobIds")
     log("")
     
     local burst = 0
     while true do
-        -- Already in server we targeted
+        -- Already in target server
         if game.JobId ~= "" and game.JobId == State.currentJobId then
-            -- slow down while settled
             wait(5)
         else
             if State.retryCount >= CONFIG.MAX_RETRY_ATTEMPTS then
-                if State.currentJobId then blockJobId(State.currentJobId, "Max retries exceeded") end
+                if State.currentJobId then 
+                    blockJobId(State.currentJobId, "Max retries exceeded") 
+                end
                 State.currentJobId = nil
                 State.retryCount = 0
                 wait(CONFIG.RETRY_DELAY)
             end
+            
             if not State.currentJobId then
                 State.currentJobId = getNextJobId()
                 if not State.currentJobId then
                     wait(CONFIG.RETRY_DELAY)
                 end
             end
+            
             if State.currentJobId then
-                -- Pre-block it so others can't pick it concurrently
                 local jid = State.currentJobId
                 if jid and jid ~= "" then
                     preBlockJobId(jid)
-                    local ok = attemptTeleport(jid)
-                    if not ok then
-                        -- release attempt? (already blocklisted to avoid thrash)
-                    end
+                    attemptTeleport(jid)
                 else
                     State.currentJobId = nil
                 end
-                if not ok then
-                    -- immediate new try next loop
-                end
             end
         end
+        
         burst = burst + 1
         if burst >= CONFIG.MAX_LOOP_BURST then
             burst = 0
             wait(CONFIG.CHECK_INTERVAL)
         else
-            task.wait() -- yield briefly
+            task.wait()
         end
     end
 end
@@ -419,7 +335,7 @@ Players.LocalPlayer.OnTeleport:Connect(function(state)
 end)
 
 -- ===== STARTUP =====
-log("Initializing local file hopper...")
+log("Initializing mobile hopper (Pastebin mode)...")
 wait(0.1)
 
 -- Start the main loop
@@ -430,4 +346,4 @@ spawn(function()
     end
 end)
 
-log("✅ Server hopper is running!")
+log("✅ Server hopper is running (Mobile Support - Pastebin)!")
