@@ -1,349 +1,246 @@
--- FULLY AUTOMATIC ROBLOX HOPPER - MOBILE SUPPORT (PASTEBIN MODE)
--- This script uses Pastebin instead of local files for Android/mobile executors
--- Reads job IDs from Pastebin raw URL updated by scannermobile.js
+-- MOBILE SERVER HOPPER - FIREBASE (via Render bridge)
+-- Reads JobIds from your Render server (backed by Firebase), and writes block/skip ops back to it
 
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local Players = game:GetService("Players")
 
--- ===== CONFIGURATION =====
+-- ===== CONFIG =====
 local CONFIG = {
-    -- Pastebin Configuration (replace with your actual Pastebin raw URL)
-    PASTEBIN_RAW_URL = getgenv().PASTEBIN_RAW_URL or "https://gist.githubusercontent.com/pjglizzyoyogz-bot/bb2baf7e03d5a50cb282e8931384317d/raw/b7b3b9563a846f913f8de24b6cfa8c7c86e5aa9d/jobids.json",
-    
-    -- Game Configuration
-    UNIVERSE_ID = 109983668079237, -- place/universe id used for teleport
-    PLACE_ID = 109983668079237,    -- explicit place id
-    
-    -- Timing
+    BRIDGE_URL = (getgenv and getgenv().HOPPER_BRIDGE_URL) or "https://mobiwqe23ijh293gn34g34g-1.onrender.com",
     CHECK_INTERVAL = 0.25,
     RETRY_DELAY = 0.5,
     MAX_RETRY_ATTEMPTS = 3,
     FAST_MODE = true,
-    CACHE_TTL = 2, -- seconds to cache HTTP responses
+    CACHE_TTL = 2,
     MAX_LOOP_BURST = 15,
-    
-    -- Client ID
-    CLIENT_ID = HttpService:GenerateGUID(false)
 }
 
--- ===== HTTP REQUEST HELPER =====
-local request = (function()
-    local methods = {
-        syn and syn.request,
-        http and http.request,
-        http_request,
-        fluxus and fluxus.request,
-        request
+-- ===== HTTP REQUEST DETECTION (matches autojoiner.lua style) =====
+local function buildHttpRequest()
+    local g = getgenv and getgenv() or _G
+    local candidates = {
+        g and g.request,
+        rawget(_G, "request"),
+        g and g.http_request,
+        rawget(_G, "http_request"),
+        (syn and syn.request),
+        (http and http.request),
+        (fluxus and fluxus.request),
+        rawget(_G, "httprequest"),
     }
-    for _, method in ipairs(methods) do
-        if method then return method end
+    for _, fn in ipairs(candidates) do
+        if type(fn) == "function" then return fn end
     end
-    error("No HTTP request function found!")
-end)()
-
--- ===== SHARED GLOBAL STATE =====
-_G.ServerHopperShared = _G.ServerHopperShared or {
-    assignedJobIds = {},
-    localBlocklist = {}
-}
-
--- ===== STATE =====
-local State = {
-    currentJobId = nil,
-    isAttemptingJoin = false,
-    retryCount = 0,
-    assignedJobIds = {},
-    lastBlocklistCheck = 0
-}
-
--- ===== LOGGING =====
-local function log(message, level)
-    if CONFIG.FAST_MODE and level ~= "ERROR" and level ~= "WARN" then return end
-    level = level or "INFO"
-    local timestamp = os.date("%H:%M:%S")
-    print(string.format("[%s][%s] %s", timestamp, level, message))
-end
-
-local function logError(message) log(message, "ERROR") end
-local function logWarning(message) log(message, "WARN") end
-
--- ===== PASTEBIN STORAGE (replaces file I/O) =====
-local _cache = { data = nil, ts = 0 }
-
-local function httpGetJobStore()
-    local url = CONFIG.PASTEBIN_RAW_URL
-    local ok, response = pcall(function()
-        return request({
-            Url = url,
-            Method = "GET",
-            Headers = { ["Accept"] = "application/json" }
-        })
-    end)
-    
-    if not ok or not response or response.StatusCode ~= 200 then
-        logError("Failed to fetch job store from Pastebin")
-        return nil
-    end
-    
-    local parseOk, data = pcall(function()
-        return HttpService:JSONDecode(response.Body)
-    end)
-    
-    if not parseOk then
-        logError("Failed to parse job store response")
-        return nil
-    end
-    
-    return data
-end
-
-local function httpBlockJobId(jobId, reason)
-    -- Pastebin is read-only for clients, just track locally
-    table.insert(_G.ServerHopperShared.localBlocklist, jobId)
-    log("🚫 Locally blocked JobId: " .. jobId .. " (" .. (reason or "unknown") .. ")")
-    return true
-end
-
-local function httpSkipJobId(jobId)
-    -- Pastebin is read-only, skip functionality is client-side only
-    if not CONFIG.FAST_MODE then log("⏭️ Skipping JobId: " .. jobId) end
-end
-
-local function storageRead(force)
-    local now = os.clock()
-    if not force and _cache.data and (now - _cache.ts) < CONFIG.CACHE_TTL then
-        return _cache.data
-    end
-    
-    local result = httpGetJobStore()
-    
-    if result then
-        _cache.data = result
-        _cache.ts = now
-        return result
-    end
-    
-    -- Fallback to cached data
-    if _cache.data then
-        if not CONFIG.FAST_MODE then log("Using cached data due to fetch failure") end
-        return _cache.data
-    end
-    
     return nil
 end
 
--- ===== JOB ID MANAGEMENT =====
+local request = buildHttpRequest()
+if not request then error("No HTTP request function found!") end
+
+-- ===== SHARED STATE =====
+_G.ServerHopperShared = _G.ServerHopperShared or { assignedJobIds = {}, localBlocklist = {} }
+local State = { currentJobId = nil, isAttemptingJoin = false, retryCount = 0, assignedJobIds = {} }
+
+-- ===== UTILS =====
+local function log(msg, level)
+    if CONFIG.FAST_MODE and level ~= "ERROR" and level ~= "WARN" then return end
+    print(string.format("[%s] %s", level or "INFO", msg))
+end
+local function logError(m) log(m, "ERROR") end
+local function logWarn(m) log(m, "WARN") end
+
+-- ===== BRIDGE API =====
+local _cache = { data = nil, ts = 0 }
+
+local function httpJSON(method, path, bodyTable)
+    local ok, resp = pcall(function()
+        return request({
+            Url = string.format("%s%s", CONFIG.BRIDGE_URL, path),
+            Method = method,
+            Headers = { ["Accept"] = "application/json", ["Content-Type"] = "application/json" },
+            Body = bodyTable and HttpService:JSONEncode(bodyTable) or nil
+        })
+    end)
+    if not ok or not resp then return nil end
+    if resp.StatusCode ~= 200 then return { _status = resp.StatusCode } end
+    local parseOK, data = pcall(function() return HttpService:JSONDecode(resp.Body) end)
+    if not parseOK then return nil end
+    return data
+end
+
+local function fetchStore(force)
+    local now = os.clock()
+    if not force and _cache.data and (now - _cache.ts) < CONFIG.CACHE_TTL then return _cache.data end
+    local data = httpJSON("GET", "/jobstore")
+    if data and type(data) == "table" then _cache.data = data; _cache.ts = now; return data end
+    return _cache.data
+end
+
+local function bridgeBlock(jobId, reason)
+    local _ = httpJSON("POST", "/jobstore/block", { jobId = jobId, reason = reason or "client" })
+end
+local function bridgeSkip(jobId)
+    local _ = httpJSON("POST", "/jobstore/skip", { jobId = jobId })
+end
+
+-- ===== JOB PICKING =====
 local function getNextJobId()
-    local data = storageRead()
+    local data = fetchStore()
     if not data then return nil end
-    
     local available = data.availableJobIds or {}
     local blocklist = data.blocklist or {}
-    
+
     if #available == 0 then return nil end
-    
-    -- Build fast lookup sets
-    local blockedSet = {}
-    for _, b in ipairs(blocklist) do blockedSet[b] = true end
-    
-    local triedSet = {}
-    for _, t in ipairs(State.assignedJobIds) do triedSet[t] = true end
-    
-    local globalAssigned = _G.ServerHopperShared.assignedJobIds
-    
-    -- Reservoir-style random pick
-    local pick = nil
-    local count = 0
-    
-    for _, jobId in ipairs(available) do
-        if not blockedSet[jobId] and not triedSet[jobId] and 
-           (not globalAssigned[jobId] or globalAssigned[jobId] == CONFIG.CLIENT_ID) then
-            count = count + 1
-            if math.random(count) == 1 then pick = jobId end
+
+    local blocked = {}
+    for _, b in ipairs(blocklist) do blocked[b] = true end
+    for _, b in ipairs(_G.ServerHopperShared.localBlocklist) do if type(b) == "string" then blocked[b] = true end end
+
+    local tried = {}; for _, t in ipairs(State.assignedJobIds) do tried[t] = true end
+    local claimed = _G.ServerHopperShared.assignedJobIds
+
+    local pick, count
+    for _, id in ipairs(available) do
+        if not blocked[id] and not tried[id] and (not claimed[id] or claimed[id] == "MOBILE") then
+            count = (count or 0) + 1
+            if math.random(count) == 1 then pick = id end
         end
     end
-    
-    if not pick then
-        logWarning("No valid JobId (all blocked/used)")
-        return nil
-    end
-    
+    if not pick then return nil end
     table.insert(State.assignedJobIds, pick)
-    globalAssigned[pick] = CONFIG.CLIENT_ID
-    
-    if not CONFIG.FAST_MODE then log("Selected JobId: " .. pick) end
+    claimed[pick] = "MOBILE"
+    -- reset per-job retry counter when we select a new job
+    State.retryCount = 0
     return pick
 end
 
-local function blockJobId(jobId, reason)
-    log("🚫 Blocking JobId: " .. jobId .. " | Reason: " .. reason)
-    table.insert(_G.ServerHopperShared.localBlocklist, jobId)
-    httpBlockJobId(jobId, reason)
-end
-
-local function preBlockJobId(jobId)
-    -- Pre-block immediately to prevent race conditions
-    httpBlockJobId(jobId, "pre_block_before_teleport")
-    _G.ServerHopperShared.localBlocklist[jobId] = true
-    return true
-end
-
--- ===== TELEPORT LOGIC =====
-local function parseErrorReason(errorMsg)
-    local errorLower = tostring(errorMsg):lower()
-    
-    if string.find(errorLower, "full") or string.find(errorLower, "capacity") then
-        return "Server is full"
-    elseif string.find(errorLower, "can't join private") or string.find(errorLower, "cant join private") or 
-           string.find(errorLower, "unauthorized") then
-        return "Private / Unauthorized instance"
-    elseif string.find(errorLower, "invalid") or string.find(errorLower, "not found") then
-        return "Invalid or closed server"
-    elseif string.find(errorLower, "restricted") or string.find(errorLower, "private") then
-        return "Server is private or restricted"
-    else
-        return "Unknown error: " .. tostring(errorMsg)
+local function addLocalBlock(jobId)
+    if not _G.ServerHopperShared.localBlocklist[jobId] then
+        table.insert(_G.ServerHopperShared.localBlocklist, jobId)
+        _G.ServerHopperShared.localBlocklist[jobId] = true
     end
+    if _cache.data and _cache.data.availableJobIds then
+        local out = {}
+        for _, id in ipairs(_cache.data.availableJobIds) do if id ~= jobId then table.insert(out, id) end end
+        _cache.data.availableJobIds = out
+    end
+end
+
+-- ===== TELEPORT =====
+local function parseError(err)
+    local e = tostring(err):lower()
+    if e:find("full") or e:find("capacity") then return "full" end
+    if e:find("ended") or e:find("game ended") then return "ended" end
+    if e:find("private") or e:find("unauthorized") or e:find("restricted") then return "private" end
+    if e:find("invalid") or e:find("not found") then return "invalid" end
+    return "unknown"
 end
 
 local function attemptTeleport(jobId)
     if State.isAttemptingJoin then return false end
-    if not jobId or jobId == "" then
-        logError("AttemptTeleport called with nil/empty jobId")
-        return false
-    end
-    
+    if not jobId or jobId == "" then return false end
     State.isAttemptingJoin = true
-    if not CONFIG.FAST_MODE then log("Attempt teleport -> " .. tostring(jobId)) end
-    
-    local player = Players.LocalPlayer
-    local success, errorMessage = pcall(function()
-        TeleportService:TeleportToPlaceInstance(CONFIG.PLACE_ID or CONFIG.UNIVERSE_ID, jobId, player)
+    if not CONFIG.FAST_MODE then log("Attempt teleport -> "..jobId.." | place="..tostring(game.PlaceId)) end
+
+    -- pre-block remotely so other clients don't race
+    addLocalBlock(jobId)
+    task.spawn(function() bridgeBlock(jobId, "pre_block") end)
+
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, Players.LocalPlayer)
     end)
-    
-    if not success then
-        local reason = parseErrorReason(errorMessage)
-        logError("Teleport failed: " .. reason .. " | jobId=" .. tostring(jobId))
-        
-        -- Check if server is full (skip) vs unavailable (block)
-        if string.find(reason:lower(), "full") then
-            httpSkipJobId(jobId)
+    if not ok then
+        local kind = parseError(err)
+        -- For definitive cases, give up on this job immediately
+        if kind == "full" then
+            -- Server full: treat as non-fatal for flow, move on to a new job
+            bridgeSkip(jobId)
+            State.isAttemptingJoin = false
+            State.currentJobId = nil
+            State.retryCount = State.retryCount + 1
+            return false
+        elseif kind == "private" or kind == "invalid" or kind == "ended" then
+            -- These won't recover by retrying the same job
+            bridgeBlock(jobId, "teleport_failed_"..kind)
+            State.isAttemptingJoin = false
+            State.currentJobId = nil
+            State.retryCount = State.retryCount + 1
+            return false
         else
-            blockJobId(jobId, reason)
+            -- Unknown/transient: retry the SAME job up to MAX_RETRY_ATTEMPTS
+            State.retryCount = State.retryCount + 1
+            if State.retryCount < CONFIG.MAX_RETRY_ATTEMPTS then
+                State.isAttemptingJoin = false
+                if not CONFIG.FAST_MODE then logWarn("Retrying same jobId due to transient error ("..tostring(State.retryCount).."/"..tostring(CONFIG.MAX_RETRY_ATTEMPTS)..")") end
+                wait(CONFIG.RETRY_DELAY)
+                return false
+            else
+                bridgeBlock(jobId, "max_retries_unknown")
+                State.isAttemptingJoin = false
+                State.currentJobId = nil
+                return false
+            end
         end
-        
-        State.isAttemptingJoin = false
-        State.currentJobId = nil
-        State.retryCount = State.retryCount + 1
-        return false
     end
-    
-    if not CONFIG.FAST_MODE then log("Teleport initiated jobId=" .. tostring(jobId)) end
+    if not CONFIG.FAST_MODE then log("Teleport initiated: "..jobId) end
     return true
 end
 
 -- ===== MAIN LOOP =====
 local function mainLoop()
-    log("╔════════════════════════════════════════════════════════════╗")
-    log("║    🎮 AUTOMATIC SERVER HOPPER - MOBILE SUPPORT (PASTEBIN) ║")
-    log("╚════════════════════════════════════════════════════════════╝")
-    log("Client ID: " .. CONFIG.CLIENT_ID)
-    log("Universe ID: " .. CONFIG.UNIVERSE_ID)
-    log("Pastebin URL: " .. CONFIG.PASTEBIN_RAW_URL)
-    log("════════════════════════════════════════════════════════════")
-    
-    -- Resilient store loading
-    local attempt = 0
-    local testData
-    repeat
-        attempt = attempt + 1
-        if attempt == 1 then
-            log("🔍 Loading job store from Pastebin...")
-        else
-            logWarning("Retrying fetch (attempt " .. attempt .. ")")
-        end
-        testData = storageRead(true)
-        if not testData then
-            local backoff = math.min(10, 1 * 2 ^ math.min(6, attempt - 1))
-            logWarning("Pastebin unreachable. Backing off for " .. backoff .. "s")
-            wait(backoff)
-        end
-    until testData ~= nil
-    
-    log("✅ Store ready after " .. attempt .. " attempt(s)")
-    log("📊 Found " .. #(testData.availableJobIds or {}) .. " available JobIds")
-    log("")
-    
+    log("Hopper (Firebase) starting...")
     local burst = 0
     while true do
-        -- Already in target server
         if game.JobId ~= "" and game.JobId == State.currentJobId then
             wait(5)
         else
-            if State.retryCount >= CONFIG.MAX_RETRY_ATTEMPTS then
-                if State.currentJobId then 
-                    blockJobId(State.currentJobId, "Max retries exceeded") 
-                end
+            -- Per-job retry handled inside attemptTeleport; keep this as a safety for any stray state
+            if State.retryCount >= CONFIG.MAX_RETRY_ATTEMPTS and State.currentJobId then
+                bridgeBlock(State.currentJobId, "max_retries_safety")
                 State.currentJobId = nil
                 State.retryCount = 0
                 wait(CONFIG.RETRY_DELAY)
             end
-            
             if not State.currentJobId then
                 State.currentJobId = getNextJobId()
-                if not State.currentJobId then
-                    wait(CONFIG.RETRY_DELAY)
-                end
+                if not State.currentJobId then wait(CONFIG.RETRY_DELAY) end
             end
-            
             if State.currentJobId then
                 local jid = State.currentJobId
                 if jid and jid ~= "" then
-                    preBlockJobId(jid)
                     attemptTeleport(jid)
                 else
                     State.currentJobId = nil
                 end
             end
         end
-        
         burst = burst + 1
-        if burst >= CONFIG.MAX_LOOP_BURST then
-            burst = 0
-            wait(CONFIG.CHECK_INTERVAL)
-        else
-            task.wait()
-        end
+        if burst >= CONFIG.MAX_LOOP_BURST then burst = 0; wait(CONFIG.CHECK_INTERVAL) else task.wait() end
     end
 end
 
--- ===== EVENT HANDLERS =====
+-- Mirror hopperviajson: react to Teleport failures and keep trying
 Players.LocalPlayer.OnTeleport:Connect(function(state)
     if state == Enum.TeleportState.Started then
-        log("🔄 Teleport started...")
+        if not CONFIG.FAST_MODE then log("Teleport started...") end
     elseif state == Enum.TeleportState.InProgress then
-        log("🔄 Teleport in progress...")
+        if not CONFIG.FAST_MODE then log("Teleport in progress...") end
     elseif state == Enum.TeleportState.Failed then
-        logError("❌ Teleport failed!")
+        logError("Teleport failed (OnTeleport)")
         if State.currentJobId then
-            blockJobId(State.currentJobId, "Teleport failed (OnTeleport event)")
+            -- Treat as a failure of the current job and move on
+            bridgeBlock(State.currentJobId, "teleport_event_failed")
             State.currentJobId = nil
         end
         State.isAttemptingJoin = false
+        State.retryCount = State.retryCount + 1
     end
 end)
 
--- ===== STARTUP =====
-log("Initializing mobile hopper (Pastebin mode)...")
-wait(0.1)
-
--- Start the main loop
 spawn(function()
-    local success, error = pcall(mainLoop)
-    if not success then
-        logError("💀 Fatal error: " .. tostring(error))
-    end
+    local ok, err = pcall(mainLoop)
+    if not ok then logError("Fatal: "..tostring(err)) end
 end)
 
-log("✅ Server hopper is running (Mobile Support - Pastebin)!")
+log("✅ mobileserverhop_firebase loaded. Set getgenv().HOPPER_BRIDGE_URL to your Render URL before executing.")
